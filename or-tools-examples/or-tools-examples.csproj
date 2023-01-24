@@ -10,7 +10,6 @@
 
   <ItemGroup>
     <PackageReference Include="Google.OrTools" Version="9.5.2237" />
-    <PackageReference Include="Google.OrTools.runtime.win-x64" Version="9.5.2237" />
   </ItemGroup>
 
   <ItemGroup>

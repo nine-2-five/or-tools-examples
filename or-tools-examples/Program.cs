@@ -25,9 +25,19 @@ public class VrpPickupDelivery
             {43,49,68,105,76,35,82,91,0 }
         };
 
-        public int[][] PickupsDeliveries = {
-            new int[] { 1, 6 }, new int[] { 2, 4 },  new int[] { 5, 1 },   new int[] { 7, 3 }   
+        /* seems like enough space to solve at least a couple of pickups, based on durations in the time matrix above */
+        public long[,] TimeWindows =
+        {
+            {0,0},            
+            {360,360},
+            {480,480},
+            {720,720}
         };
+
+        public int[][] PickupsDeliveries = {
+            new int[] { 1, 6 }, new int[] { 2, 4 },  new int[] { 5,8 },   new int[] { 7, 3 }   
+        };
+
         public int VehicleNumber = 4;
         public int Depot = 0;
     };    
@@ -67,79 +77,90 @@ public class VrpPickupDelivery
         DataModel data = new DataModel();
 
         //data.TimeMatrix = Helper.GetTimeMatrix("./data1.json");
-
         //var strArray = Helper.SerializeArray(data.TimeMatrix);
-
         //File.WriteAllText("./timeMatrix.txt", strArray);
+     
+        // Create Routing Index Manager
+        RoutingIndexManager manager =
+            new RoutingIndexManager(data.TimeMatrix.GetLength(0), data.VehicleNumber, data.Depot);
 
-        try
+        // Create Routing Model.
+        RoutingModel routing = new RoutingModel(manager);
+
+        // Create and register a transit callback.
+        int transitCallbackIndex = routing.RegisterTransitCallback((long fromIndex, long toIndex) =>
         {
-            // Create Routing Index Manager
-            RoutingIndexManager manager =
-                new RoutingIndexManager(data.TimeMatrix.GetLength(0), data.VehicleNumber, data.Depot);
+            // Convert from routing variable Index to
+            // distance matrix NodeIndex.
 
+            var fromNode = manager.IndexToNode(fromIndex);
+            var toNode = manager.IndexToNode(toIndex);
 
-            // Create Routing Model.
-            RoutingModel routing = new RoutingModel(manager);
+            return data.TimeMatrix[fromNode, toNode];                        
+        });
 
-            // Create and register a transit callback.
-            int transitCallbackIndex = routing.RegisterTransitCallback((long fromIndex, long toIndex) =>
-            {
-                // Convert from routing variable Index to
-                // distance matrix NodeIndex.
-                int fromNode;
-                int toNode;
-                try
-                {
-                    fromNode = manager.IndexToNode(fromIndex);
-                    toNode = manager.IndexToNode(toIndex);
-                    return data.TimeMatrix[fromNode, toNode];
-                }
-                catch(Exception ex)
-                {
-                    Console.WriteLine(ex.ToString());
-                }
-                return 123;
-            });
+        // Define cost of each arc.
+        routing.SetArcCostEvaluatorOfAllVehicles(transitCallbackIndex);
 
-            // Define cost of each arc.
-            routing.SetArcCostEvaluatorOfAllVehicles(transitCallbackIndex);
+        // Add time constraint.
+        routing.AddDimension(transitCallbackIndex, 1, 3000,
+                                true, // start cumul to zero
+                                "Time");
+        RoutingDimension timeDimension = routing.GetMutableDimension("Time");
+        timeDimension.SetGlobalSpanCostCoefficient(100); /* what does this do? */
 
-            // Add time constraint.
-            routing.AddDimension(transitCallbackIndex, 0, 3000,
-                                 true, // start cumul to zero
-                                 "Time");
-            RoutingDimension timeDimension = routing.GetMutableDimension("Time");
-            timeDimension.SetGlobalSpanCostCoefficient(100);
-
-            // Define Transportation Requests.
-            Solver solver = routing.solver();
-            for (int i = 0; i < data.PickupsDeliveries.GetLength(0); i++)
-            {
-                long pickupIndex = manager.NodeToIndex(data.PickupsDeliveries[i][0]);
-                long deliveryIndex = manager.NodeToIndex(data.PickupsDeliveries[i][1]);
-                routing.AddPickupAndDelivery(pickupIndex, deliveryIndex);
-                solver.Add(solver.MakeEquality(routing.VehicleVar(pickupIndex), routing.VehicleVar(deliveryIndex)));
-                solver.Add(solver.MakeLessOrEqual(timeDimension.CumulVar(pickupIndex),
-                                                  timeDimension.CumulVar(deliveryIndex)));
-            }
-
-            // Setting first solution heuristic.
-            RoutingSearchParameters searchParameters =
-                operations_research_constraint_solver.DefaultRoutingSearchParameters();
-            searchParameters.FirstSolutionStrategy = FirstSolutionStrategy.Types.Value.PathCheapestArc;
-
-            // Solve the problem.
-            Assignment solution = routing.SolveWithParameters(searchParameters);
-
-            // Print solution on console.
-            PrintSolution(data, routing, manager, solution);
-        }
-        catch(Exception ex)
+        // Add time window constraints for each location except depot.
+        for (int i = 1; i < data.TimeWindows.GetLength(0); ++i) /* not sure if I should include the first time window instead of skipping the i=0 */
         {
-            Console.WriteLine(ex.Message);
+            long index = manager.NodeToIndex(i);
+            timeDimension.CumulVar(index).SetRange(data.TimeWindows[i, 0], data.TimeWindows[i, 1]);
         }
-        
+        // Add time window constraints for each vehicle start node.
+        for (int i = 0; i < data.VehicleNumber; ++i)
+        {
+            long index = routing.Start(i);
+            timeDimension.CumulVar(index).SetRange(data.TimeWindows[0, 0], data.TimeWindows[0, 1]);
+        }
+        // [END time_constraint]
+
+        // Instantiate route start and end times to produce feasible times.
+        // [START depot_start_end_times]
+        for (int i = 0; i < data.VehicleNumber; ++i)
+        {
+            routing.AddVariableMinimizedByFinalizer(timeDimension.CumulVar(routing.Start(i)));
+            routing.AddVariableMinimizedByFinalizer(timeDimension.CumulVar(routing.End(i)));
+        }
+        // [END depot_start_end_times]
+
+        // Allow to drop nodes.
+        long penalty = 100000;
+        for (int i = 1; i < data.TimeMatrix.GetLength(0); ++i)
+        {
+            routing.AddDisjunction(new long[] { manager.NodeToIndex(i) }, penalty);
+        }
+
+        // Define Transportation Requests.
+        Solver solver = routing.solver();
+        for (int i = 0; i < data.PickupsDeliveries.GetLength(0); i++)
+        {
+            long pickupIndex = manager.NodeToIndex(data.PickupsDeliveries[i][0]);
+            long deliveryIndex = manager.NodeToIndex(data.PickupsDeliveries[i][1]);
+            routing.AddPickupAndDelivery(pickupIndex, deliveryIndex);
+            solver.Add(solver.MakeEquality(routing.VehicleVar(pickupIndex), routing.VehicleVar(deliveryIndex)));
+            solver.Add(solver.MakeLessOrEqual(timeDimension.CumulVar(pickupIndex),
+                                                timeDimension.CumulVar(deliveryIndex)));
+        }
+
+        // Setting first solution heuristic.
+        RoutingSearchParameters searchParameters =
+            operations_research_constraint_solver.DefaultRoutingSearchParameters();
+        searchParameters.FirstSolutionStrategy = FirstSolutionStrategy.Types.Value.PathCheapestArc;
+
+        // Solve the problem.
+        Assignment solution = routing.SolveWithParameters(searchParameters);
+
+        // Print solution on console.
+        PrintSolution(data, routing, manager, solution);               
 
         Console.ReadKey();
     }
